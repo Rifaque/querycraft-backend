@@ -3,7 +3,9 @@ require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const authRoutes = require('./routes/auth');
-const queryRoutes = require('./routes/query'); // keep your other routes
+const queryRoutes = require('./routes/query');
+const chatRoutes = require('./routes/chat'); 
+
 const app = express();
 
 const PORT = process.env.PORT || 4000;
@@ -20,7 +22,8 @@ app.use(express.urlencoded({ extended: true }));  // parse application/x-www-for
 
 // Routes
 app.use('/api/auth', authRoutes);
-app.use('/api/query', queryRoutes); // existing
+app.use('/api/query', queryRoutes);
+app.use('/api/chat', chatRoutes);
 
 // Health check
 app.get('/', (req, res) => res.send('QueryCraft backend is up'));
