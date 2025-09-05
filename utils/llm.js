@@ -30,7 +30,7 @@ function normalizeModel(input) {
 /**
  * Query LLM. If LLM_ENDPOINT is set (default points to local Ollama),
  * it will POST { prompt, model, max_tokens, temperature } to that url.
- * Otherwise falls back to OpenAI Chat Completions (requires OPENAI_API_KEY).
+ * Otherwise falls back to OpenAI Chat Completions.
  *
  * Returns { text, raw, usage, sql? }
  */
@@ -38,6 +38,56 @@ async function queryLLM({ prompt, model = null, max_tokens = 512, temperature = 
   if (!prompt || !prompt.trim()) throw new Error('Empty prompt');
 
   const chosenModel = normalizeModel(model);
+
+  // Helper to try multiple places in the raw response for the "actual" text
+  function extractPossibleTextFromRaw(raw) {
+    if (raw == null) return '';
+
+    // If raw is already a string, that's candidate (may be JSON-encoded)
+    if (typeof raw === 'string') return raw;
+
+    // Common top-level fields
+    if (typeof raw.text === 'string') return raw.text;
+    if (typeof raw.response === 'string') return raw.response;
+    if (typeof raw.output === 'string') return raw.output;
+    if (typeof raw.result === 'string') return raw.result;
+
+    // Some endpoints return { data: { text: '...' } }
+    if (raw.data && typeof raw.data.text === 'string') return raw.data.text;
+
+    // OpenAI-style choices
+    if (raw.choices && Array.isArray(raw.choices) && raw.choices.length > 0) {
+      const c = raw.choices[0];
+      // Chat-style message
+      if (c.message && typeof c.message.content === 'string') return c.message.content;
+      // text field
+      if (typeof c.text === 'string') return c.text;
+      // sometimes message.content is array blocks
+      if (c?.message?.content && Array.isArray(c.message.content)) {
+        for (const block of c.message.content) {
+          if (typeof block === 'string') return block;
+          if (block?.text && typeof block.text === 'string') return block.text;
+        }
+      }
+    }
+
+    // Some endpoints return output as array of blocks
+    if (Array.isArray(raw.output) && raw.output.length) {
+      // join textual blocks
+      try {
+        return raw.output.map(o => (typeof o === 'string' ? o : (o?.text || ''))).join('\n');
+      } catch (e) {
+        // fallback
+      }
+    }
+
+    // Fallback: stringify some part of raw (limited)
+    try {
+      return JSON.stringify(raw).slice(0, 20000);
+    } catch (e) {
+      return '';
+    }
+  }
 
   if (LLM_ENDPOINT) {
     try {
@@ -57,54 +107,13 @@ async function queryLLM({ prompt, model = null, max_tokens = 512, temperature = 
       });
 
       const raw = resp.data;
-      let text = '';
+      const possible = extractPossibleTextFromRaw(raw);
 
-      // Flexible parsing for different LLM response shapes (extract raw textual part)
-      if (!raw && raw !== '') {
-        text = '';
-      } else if (typeof raw === 'string') {
-        text = raw;
-      } else if (typeof raw.output === 'string') {
-        text = raw.output;
-      } else if (typeof raw.result === 'string') {
-        text = raw.result;
-      } else if (raw?.choices && Array.isArray(raw.choices) && raw.choices.length > 0) {
-        const c = raw.choices[0];
-        if (c?.message?.content && typeof c.message.content === 'string') text = c.message.content;
-        else if (c?.text && typeof c.text === 'string') text = c.text;
-        else if (c?.message?.content && Array.isArray(c.message.content)) {
-          for (const block of c.message.content) {
-            if (block?.type === 'output_text' && typeof block.text === 'string') {
-              text = block.text;
-              break;
-            }
-            if (block?.text && typeof block.text === 'string') {
-              text = block.text;
-              break;
-            }
-          }
-        }
-      } else if (Array.isArray(raw?.output)) {
-        text = raw.output.join('\n');
-      } else if (typeof raw === 'object') {
-        if (raw?.response && typeof raw.response === 'string') {
-          text = raw.response;
-        } else if (raw?.message?.content) {
-          text = typeof raw.message.content === 'string'
-            ? raw.message.content
-            : JSON.stringify(raw.message.content).slice(0, 2000);
-        } else {
-          text = JSON.stringify(raw).slice(0, 2000);
-        }
-      } else {
-        text = String(raw).slice(0, 2000);
-      }
-
-      // Now parse & clean the textual content (extract response body, strip fences, pull SQL)
-      const { cleanedText, sql } = parseLLMResponseText(text, raw);
+      // parse & clean the textual content (extract response body, strip fences, pull SQL)
+      const { cleanedText, sql } = parseLLMResponseText(possible, raw);
 
       const usage = raw?.usage || null;
-      return { text: cleanedText || text || '', raw, usage, sql: sql || null };
+      return { text: cleanedText || possible || '', raw, usage, sql: sql || null };
     } catch (err) {
       const msg = err?.response?.data ? JSON.stringify(err.response.data).slice(0, 1000) : err.message;
       const e = new Error(`LLM endpoint error: ${msg}`);
@@ -136,12 +145,11 @@ async function queryLLM({ prompt, model = null, max_tokens = 512, temperature = 
     });
 
     const raw = resp.data;
-    const extracted = (raw?.choices && raw.choices[0]?.message?.content) || (raw?.choices && raw.choices[0]?.text) || '';
-    // Clean / parse OpenAI text similarly
-    const { cleanedText, sql } = parseLLMResponseText(extracted, raw);
+    const possible = extractPossibleTextFromRaw(raw);
+    const { cleanedText, sql } = parseLLMResponseText(possible, raw);
 
     const usage = raw?.usage || null;
-    return { text: cleanedText || extracted || '', raw, usage, sql: sql || null };
+    return { text: cleanedText || possible || '', raw, usage, sql: sql || null };
   } catch (err) {
     const msg = err?.response?.data ? JSON.stringify(err.response.data).slice(0, 1000) : err.message;
     const e = new Error(`OpenAI request error: ${msg}`);
