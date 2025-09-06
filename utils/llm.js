@@ -11,7 +11,7 @@ const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'mistral:7b-instruct';
 const MODEL_MAP = {
   'mistral': 'mistral:7b-instruct',
   'mistral:7b-instruct': 'mistral:7b-instruct',
-  'mistral:7b': 'mistral:7b',
+  'mistral:7b': 'mistral:7b-instruct',
   'qwen4': 'qwen:4b',
   'qwen:4b': 'qwen:4b',
   'llama1b': 'llama3.2:1b',
