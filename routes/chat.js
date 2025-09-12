@@ -34,4 +34,12 @@ router.delete('/:id', auth, async (req, res) => {
   res.json({ success: true });
 });
 
+// Delete all chat and its queries
+router.delete('/', auth, async (req, res) => {
+  const chats = await Chat.deleteMany({  user: req.userId  });
+  if (!chats) return res.status(404).json({ error: 'Failed to delete all chats' });
+  await Query.deleteMany({ user: req.userId });
+  res.json({ success: true });
+});
+
 module.exports = router;
