@@ -16,47 +16,108 @@ const limiter = rateLimit({
 
 function sanitizePrompt(s) {
   if (!s) return '';
+  // remove nulls, trim, collapse whitespace and cap length
   return s.replace(/\u0000/g, '').trim().replace(/\s+/g, ' ').slice(0, 4000);
 }
 
-// (kept in case you want to use it later; not used in the minimal response)
-function sanitizeRawPreview(obj, opts = {}) {
-  const maxString = opts.maxString || 1000;
-  const maxArray = opts.maxArray || 10;
-  const maxDepth = opts.maxDepth || 3;
+// escape triple backticks so a user can't prematurely break the assistant's output format
+function escapeBackticks(s) {
+  return s.replace(/```/g, '`' + '``'); // neutralize triple backticks inside user input
+}
 
-  function truncStr(s) {
-    if (typeof s !== 'string') return s;
-    if (s.length <= maxString) return s;
-    return s.slice(0, maxString) + `...<truncated ${s.length - maxString} chars>`;
+function looksLikeSQL(s) {
+  if (!s) return false;
+  const sqlStarts = /^\s*(SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|WITH)\b/i;
+  return sqlStarts.test(s) || /;\s*$/.test(s) || /\bJOIN\b/i.test(s);
+}
+
+function looksLikeMongo(s) {
+  if (!s) return false;
+  // simple heuristics for mongo shell / driver usage
+  return /db\.\w+\.(find|aggregate|insert|update|remove)\s*\(/i.test(s) || /collection\(['"`]\w+['"`]\)/i.test(s);
+}
+
+/**
+ * Return a string prompt to send to the LLM which includes:
+ * - system-like guideline on how to format output
+ * - directive to either explain an input query or generate a query + explanation
+ */
+function buildGuidedPrompt(userPrompt, isUserQuery = false, queryType = 'sql_or_mongo') {
+  // keep instructions explicit and prescriptive
+  const instructionHeader = [
+    "You are an expert assistant for generating and explaining database queries (SQL and MongoDB).",
+    "Always follow this exact output pattern:",
+    "1) First line must start with: Here's the query",
+    "2) Immediately after that, include the query in fenced code block(s). Use ```sql for SQL and ```query or ```mongodb for MongoDB, e.g.:",
+    "   ```sql",
+    "   SELECT ...;",
+    "   ```",
+    "   or",
+    "   ```mongodb",
+    "   db.users.find({ ... })",
+    "   ```",
+    "3) After the fenced block(s), provide a clear explanation of what the query does, what tables/collections/fields it touches, any assumptions, and any potential issues (indexes, performance, security) if applicable.",
+    "",
+    "If the user already provided a query (SQL or MongoDB), DO NOT generate a different query — explain the provided query using the same format: show the query (fenced) and then explanation.",
+    "",
+    "Keep answers concise, readable, and developer-friendly.",
+    ""
+  ].join("\n");
+
+  const sanitized = escapeBackticks(userPrompt);
+
+  if (isUserQuery) {
+    // ask the model to explain the exact query given by the user
+    return `${instructionHeader}\n\nUser-supplied query (explain this as-is):\n\n${sanitized}\n\nRespond now.`;
+  } else {
+    // user asked in natural language: create a query and then explain it
+    return `${instructionHeader}\n\nUser request (generate an appropriate ${queryType} query from this request, then show the query and explain):\n\n${sanitized}\n\nRespond now.`;
   }
+}
 
-  function helper(value, depth = 0) {
-    if (depth > maxDepth) return '[Truncated: maxDepth]';
-    if (value == null) return value;
-    if (typeof value === 'string') return truncStr(value);
-    if (typeof value === 'number' || typeof value === 'boolean') return value;
-    if (Array.isArray(value)) {
-      const arr = value.slice(0, maxArray).map(v => helper(v, depth + 1));
-      if (value.length > maxArray) arr.push(`[+${value.length - maxArray} items truncated]`);
-      return arr;
-    }
-    if (typeof value === 'object') {
-      const out = {};
-      const keys = Object.keys(value).slice(0, 30);
-      for (const k of keys) {
-        out[k] = helper(value[k], depth + 1);
-      }
-      if (Object.keys(value).length > keys.length) out._note = `${Object.keys(value).length - keys.length} keys truncated`;
-      return out;
-    }
-    return String(value);
-  }
-
+/**
+ * Try to enforce the requested output format if the model violates it.
+ * - If the model already used a fenced block (```), return as-is.
+ * - Otherwise, attempt to find a SQL/Mongo snippet in the response and wrap it accordingly
+ * - If the user-supplied prompt was itself a query and model response is explanatory text, wrap the original query
+ */
+function enforceOutputFormat(llmText, originalPrompt, originalWasQuery) {
   try {
-    return helper(obj);
+    if (!llmText) llmText = '';
+
+    // If model already returned with fences, trust it.
+    if (/```/.test(llmText)) return llmText;
+
+    // Attempt to extract SQL-like snippet ending with semicolon (simple heuristic)
+    const sqlMatch = llmText.match(/((?:SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP)[\s\S]{0,2000}?;)/i);
+    if (sqlMatch) {
+      const querySnippet = sqlMatch[1].trim();
+      const before = llmText.slice(0, sqlMatch.index).trim();
+      const after = llmText.slice(sqlMatch.index + querySnippet.length).trim();
+      const explanation = (after || before || 'No additional explanation provided.').trim();
+      return `Here's the query\n\n\`\`\`sql\n${querySnippet}\n\`\`\`\n\n${explanation}`;
+    }
+
+    // Attempt to detect Mongo-like snippet
+    const mongoMatch = llmText.match(/(db\.[\s\S]{1,2000}?(\)|;))/i);
+    if (mongoMatch) {
+      const querySnippet = mongoMatch[1].trim().replace(/;$/, '');
+      const before = llmText.slice(0, mongoMatch.index).trim();
+      const after = llmText.slice(mongoMatch.index + querySnippet.length).trim();
+      const explanation = (after || before || 'No additional explanation provided.').trim();
+      return `Here's the query\n\n\`\`\`mongodb\n${querySnippet}\n\`\`\`\n\n${explanation}`;
+    }
+
+    // If the original prompt was itself the query, prefer showing that query and the model explanation.
+    if (originalWasQuery) {
+      return `Here's the query\n\n\`\`\`${looksLikeMongo(originalPrompt) ? 'mongodb' : 'sql'}\n${originalPrompt.trim()}\n\`\`\`\n\nExplanation:\n${llmText.trim() || 'No explanation provided.'}`;
+    }
+
+    // Fallback: wrap the whole model reply as the explanation and leave a placeholder for the query.
+    return `Here's the query\n\n\`\`\`query\n-- Could not reliably extract a single query from the assistant's output.\n-- Assistant's raw output is provided as the explanation below.\n\`\`\`\n\nExplanation:\n${llmText.trim() || 'No explanation provided.'}`;
   } catch (e) {
-    return '[Could not sanitize raw response]';
+    // if anything goes wrong, return a safe fallback
+    return `Here's the query\n\n\`\`\`query\n-- (formatting fallback) --\n\`\`\`\n\nExplanation:\nCould not format assistant output due to an internal parsing error.`;
   }
 }
 
@@ -80,9 +141,13 @@ router.post('/', limiter, auth, async (req, res) => {
   try {
     const userId = req.userId;
     const { chatId, prompt: rawPrompt, model, max_tokens, temperature } = req.body || {};
-    const prompt = sanitizePrompt(rawPrompt);
+    const cleaned = sanitizePrompt(rawPrompt);
+    if (!cleaned) return res.status(400).json({ error: 'Prompt is required' });
 
-    if (!prompt) return res.status(400).json({ error: 'Prompt is required' });
+    // Determine whether the user's prompt already *is* a query (SQL or Mongo)
+    const isSQLQuery = looksLikeSQL(cleaned);
+    const isMongoQuery = looksLikeMongo(cleaned);
+    const originalWasQuery = isSQLQuery || isMongoQuery;
 
     // Ensure chat exists (only that it belongs to the user)
     let chat = null;
@@ -90,22 +155,25 @@ router.post('/', limiter, auth, async (req, res) => {
       chat = await Chat.findOne({ _id: chatId, user: userId });
       if (!chat) return res.status(404).json({ error: 'Chat not found' });
     } else {
-      chat = await Chat.create({ user: userId, title: prompt.slice(0, 50) || 'New Chat' });
+      chat = await Chat.create({ user: userId, title: cleaned.slice(0, 50) || 'New Chat' });
     }
 
     // Create pending Query record so frontend can reference it immediately if needed
     saved = await Query.create({
       user: userId,
       chat: chat._id,
-      prompt,
+      prompt: cleaned,
       model: model || undefined,
       status: 'pending',
       createdAt: new Date()
     });
 
+    // Build the guided prompt for the LLM
+    const guidedPrompt = buildGuidedPrompt(cleaned, originalWasQuery, (isMongoQuery ? 'mongodb' : 'sql_or_mongo'));
+
     // Call LLM (synchronous)
     const llmResult = await queryLLM({
-      prompt,
+      prompt: guidedPrompt,
       model,
       max_tokens: max_tokens || 512,
       temperature: typeof temperature === 'number' ? temperature : 0.2
@@ -114,8 +182,9 @@ router.post('/', limiter, auth, async (req, res) => {
     // llmResult expected shape: { text, raw, usage, sql? }
     const { text = '', raw = null, usage = null } = llmResult || {};
 
-    // Ensure `text` is a string (safety) and store the actual generated answer as plain string
-    const answerString = (typeof text === 'string') ? text : String(text || '');
+    // Ensure `text` is a string (safety) and then enforce the output format
+    const answerStringRaw = (typeof text === 'string') ? text : String(text || '');
+    const answerString = enforceOutputFormat(answerStringRaw, cleaned, originalWasQuery);
 
     // Save result to DB: response is the plain string, raw kept for debugging
     saved.response = answerString;
