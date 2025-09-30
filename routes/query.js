@@ -52,23 +52,18 @@ function buildGuidedPrompt(userPrompt, isUserQuery = false, queryType = 'sql_or_
     "IMPORTANT: Respond ONLY with a valid JSON object with exactly two string fields: {\"query\": \"...\", \"explanation\": \"...\"}.",
     "- The \"query\" field must contain the query text only. Wrap the query inside triple backticks with the appropriate language tag (```sql or ```mongodb or ```query).",
     "- The \"explanation\" field must be a clear, concise explanation of what the query does, assumptions, affected tables/collections, and any performance/security notes.",
-    "CRITICAL RULES (do not break):",
-    "1) Produce the **minimal** query that satisfies the user's explicit request. Do NOT add extra WHERE clauses, JOINs, GROUP BYs, ORDER BYs, LIMITs, date filters, or other conditions unless the user explicitly asked for them.",
-    "2) If the user's request is ambiguous, DO NOT change the query to add inferred filters. Instead, keep the query minimal and list any inferred assumptions or suggested optional filters in the explanation.",
-    "3) If the user provided a full query, EXPLAIN THAT QUERY as-is (do not edit or 'improve' it in the query field).",
-    "4) Do NOT include any extra text outside the JSON object. If you cannot produce a query, set \"query\" to an empty string and put the reason in \"explanation\".",
+    "Do NOT include any extra text outside the JSON. If you cannot produce a query, set \"query\" to an empty string and put the reason in \"explanation\".",
+    "If the user provided a query, EXPLAIN THAT QUERY (do not invent a different query).",
     ""
   ].join("\n");
 
-  // Use a minimal generation example (teaches minimality)
   const exampleGenerate = [
     "Example (user asked to generate):",
-    `User request: "Return all students who have not paid the fees"`,
+    `User request: "Get active users who signed up in last 7 days"`,
     `Response JSON:`,
-    `{"query":"\`\`\`sql\nSELECT * FROM students WHERE paid = 0;\n\`\`\`", "explanation":"Selects all rows from students where paid = 0. No extra filters added because the user requested all unpaid students. If you wanted a date filter (e.g. last 7 days), specify it explicitly."}`
+    `{"query":"\`\`\`sql\nSELECT * FROM users WHERE active = 1 AND signup_date >= NOW() - INTERVAL 7 DAY;\n\`\`\`", "explanation":"Selects active users who signed up in the last 7 days. Assumes signup_date is a DATETIME and indexed; consider index on (active, signup_date)."}`
   ].join("\n");
 
-  // Explain example when user supplies a query to be explained
   const exampleExplain = [
     "Example (user provided a query to explain):",
     `User query: "SELECT id, name FROM users WHERE active = 1;"`,
@@ -295,7 +290,7 @@ router.post('/', limiter, auth, async (req, res) => {
   }
 });
 
-// paste/replace the existing demo route with this block
+// replace the existing demo route with this implementation
 router.post('/demo', limiter, async (req, res) => {
   try {
     const { prompt: rawPrompt, model, max_tokens, temperature } = req.body || {};
@@ -309,76 +304,87 @@ router.post('/demo', limiter, async (req, res) => {
     // default demo model -> llama3.2:1b (will be normalized in queryLLM)
     const modelParam = model || 'llama3.2:1b';
 
-    // Build guided prompt for demo
-    const guidedPrompt = buildGuidedPrompt(
+    // Build a much stricter guided prompt: only produce the query text.
+    // If ambiguous, the model MUST output exactly the token AMBIGUOUS_PROMPT (no extra text).
+    const strictGuidance = [
+      "You are an expert assistant that generates a single database query (SQL or MongoDB) from a user's natural language request.",
+      "CRITICAL: Output ONLY the query text and NOTHING ELSE. Do NOT output any explanation, JSON, or surrounding text. Do NOT use code fences.",
+      "If the correct output is an SQL query, output the SQL statement ending with a semicolon. Example: SELECT id FROM users;",
+      "If the correct output is a MongoDB shell/driver statement, output the mongo command (e.g. db.users.find({...})) exactly.",
+      "If the user's prompt is ambiguous or does not provide enough information to create an unambiguous query, DO NOT attempt to guess. Instead output exactly the single token: AMBIGUOUS_PROMPT",
+      "Do NOT add extra filters, ORDER BY, LIMIT, JOINs, or inferred conditions unless explicitly requested by the user.",
+      "",
+      "User request:",
       cleaned,
-      originalWasQuery,
-      isMongoQuery ? 'mongodb' : 'sql_or_mongo'
-    );
+      "",
+      "Now output only the query text (or AMBIGUOUS_PROMPT if ambiguous)."
+    ].join("\n");
 
-    // Call LLM (pass modelParam)
+    // Call LLM (pass modelParam). Use a deterministic temperature for consistent demo behaviour.
     const llmCall = await callLlmWithRetries(
-      guidedPrompt,
+      strictGuidance,
       modelParam,
       max_tokens || 256,
-      typeof temperature === 'number' ? temperature : 0.2,
+      typeof temperature === 'number' ? temperature : 0.0,
       cleaned,
       originalWasQuery
     );
 
     const answerStringRaw = String(llmCall?.text || '');
-    const answerString = llmCall?.formatted || enforceOutputFormat(answerStringRaw, cleaned, originalWasQuery);
+    const formattedOrRaw = llmCall?.formatted || answerStringRaw;
 
-    console.debug('DEMO LLM raw text (trim):', answerStringRaw.slice(0, 500));
-
-    // Helper: extract only the query portion from whatever the LLM returned.
+    // Helper: extract only the query portion (keeps compatibility with any model noise)
     function extractQueryOnly(formattedOrRaw, rawText) {
       const candidate = String(formattedOrRaw || rawText || '').trim();
       if (!candidate) return '';
 
-      // 1) If the candidate itself is JSON or contains JSON, try to parse
-      try {
-        // try direct parse
-        const parsed = JSON.parse(candidate);
-        if (parsed && typeof parsed === 'object') {
-          if (parsed.query) return String(parsed.query).trim();
-          if (parsed.response && typeof parsed.response === 'string') {
-            // nested string that might be JSON
-            try {
-              const nested = JSON.parse(parsed.response);
-              if (nested?.query) return String(nested.query).trim();
-            } catch {}
-          }
-        }
-      } catch (e) {
-        // not direct JSON, try to find a JSON substring
-        const jsonMatch = candidate.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          try {
-            const parsed2 = JSON.parse(jsonMatch[0]);
-            if (parsed2?.query) return String(parsed2.query).trim();
-          } catch {}
-        }
+      // If the model obeyed instructions, it may have returned "AMBIGUOUS_PROMPT"
+      if (/^\s*AMBIGUOUS_PROMPT\s*$/i.test(candidate)) return 'AMBIGUOUS_PROMPT';
+
+      // 1) If the candidate contains only a single line and looks like SQL or mongo, return it
+      if (/^(SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|WITH)\b/i.test(candidate) || /^db\./i.test(candidate)) {
+        return candidate;
       }
 
-      // 2) Look for fenced code block (```sql / ```mongodb / ```query)
+      // 2) Look for fenced codeblocks (robustness): extract inner content
       const fence = candidate.match(/```(?:sql|mongodb|query)?\n([\s\S]*?)\n```/i);
       if (fence) return fence[1].trim();
 
-      // 3) Attempt to extract SQL snippet that ends with semicolon
+      // 3) Extract SQL snippet ending in semicolon
       const sqlMatch = candidate.match(/((?:SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|WITH)[\s\S]{0,2000}?;)/i);
       if (sqlMatch) return sqlMatch[1].trim();
 
-      // 4) Attempt to extract simple mongo shell command (db.collection...)
+      // 4) Extract a simple mongo shell command
       const mongoMatch = candidate.match(/(db\.[\s\S]{1,2000}?(\)|;))/i);
       if (mongoMatch) return mongoMatch[1].trim().replace(/;$/, '');
 
-      // 5) fallback: return the whole candidate (trimmed)
+      // 5) As a last resort, return the whole candidate (trimmed) so we can inspect it client-side
       return candidate;
     }
 
-    const onlyQuery = extractQueryOnly(llmCall?.formatted || answerString, answerStringRaw);
+    const onlyQuery = extractQueryOnly(formattedOrRaw, answerStringRaw);
 
+    // If model returned ambiguous marker or extraction produced nothing meaningful -> ask user to clarify
+    const looksLikeMeaningfulQuery = (q) => {
+      if (!q) return false;
+      if (/^\s*AMBIGUOUS_PROMPT\s*$/i.test(q)) return false;
+      // has SQL keywords or mongo prefix or ends with semicolon (common heuristics)
+      if (/^(SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|WITH)\b/i.test(q)) return true;
+      if (/^db\./i.test(q)) return true;
+      if (/;$/i.test(q)) return true;
+      return false;
+    };
+
+    if (!looksLikeMeaningfulQuery(onlyQuery)) {
+      // user-facing clarification message
+      const askForClarification = 'Your prompt is ambiguous. Please provide a clearer request (specify the table/collection, fields you want, and any filters).';
+      return res.json({
+        status: 'ok',
+        response: askForClarification
+      });
+    }
+
+    // Otherwise, return the extracted query text only
     return res.json({
       status: 'ok',
       response: onlyQuery
