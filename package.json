@@ -17,8 +17,12 @@
     "dotenv": "^16.1.4",
     "express": "^4.18.2",
     "express-rate-limit": "^8.0.1",
+    "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^7.5.1",
+    "morgan": "^1.10.1",
+    "response": "^0.18.0",
+    "response-time": "^2.3.4",
     "xss": "^1.0.15"
   },
   "devDependencies": {

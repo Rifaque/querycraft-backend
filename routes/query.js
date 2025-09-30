@@ -6,16 +6,15 @@ const auth = require('../middleware/auth');
 const Query = require('../models/Query');
 const Chat = require('../models/Chat');
 const rateLimit = require('express-rate-limit');
+const { ipKeyGenerator } = require('express-rate-limit');
 
 const limiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 20,
+  max: 10,
   standardHeaders: true,
   legacyHeaders: false,
   // avoid X-Forwarded-For validation problems by using socket remoteAddress
-  keyGenerator: (req /*, res */) => {
-    return req.socket?.remoteAddress || req.ip || 'unknown';
-  }
+  keyGenerator: ipKeyGenerator,
 });
 
 function sanitizePrompt(s) {
@@ -72,6 +71,29 @@ function buildGuidedPrompt(userPrompt, isUserQuery = false, queryType = 'sql_or_
     // user asked in natural language: create a query and then explain it
     return `${instructionHeader}\n\nUser request (generate an appropriate ${queryType} query from this request, then show the query and explain):\n\n${sanitized}\n\nRespond now.`;
   }
+}
+
+async function callLlmWithRetries(guidedPrompt, model, max_tokens, temperature, originalPrompt, originalWasQuery) {
+  // First try: use provided temperature
+  const attempt = async (opts) => {
+    const llmResult = await queryLLM(opts);
+    const text = (llmResult && typeof llmResult.text === 'string') ? llmResult.text : String(llmResult?.text || '');
+    return { llmResult, text };
+  };
+
+  // Attempt 1
+  let { llmResult, text } = await attempt({ prompt: guidedPrompt, model, max_tokens, temperature });
+  // quick check: does it include JSON with query/explanation or typical fences?
+  const formatted = enforceOutputFormat(text, originalPrompt, originalWasQuery);
+  if (!/Could not reliably extract a single query/.test(formatted) && (formatted.includes("Here's the query") || /```/.test(formatted))) {
+    return { llmResult, text, formatted };
+  }
+
+  // Attempt 2 (stricter): force determinism and explicit JSON-only instruction
+  const strongerPrompt = guidedPrompt + "\n\nSECOND ATTEMPT: If you did not output the JSON object earlier, output only the JSON object now. Do NOT ask clarifying questions. Use empty \"query\" if you cannot generate one.";
+  ({ llmResult, text } = await attempt({ prompt: strongerPrompt, model, max_tokens, temperature: 0.0 }));
+  const formatted2 = enforceOutputFormat(text, originalPrompt, originalWasQuery);
+  return { llmResult, text, formatted: formatted2 };
 }
 
 function enforceOutputFormat(llmText, originalPrompt, originalWasQuery) {
