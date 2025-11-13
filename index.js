@@ -5,8 +5,9 @@ const mongoose = require('mongoose');
 const morgan = require('morgan');
 const helmet = require('helmet');
 const authRoutes = require('./routes/auth');
-const queryRoutes = require('./routes/query');
-const chatRoutes = require('./routes/chat'); 
+const queryRoutes = require('./routes/query'); // keep your existing main query routes
+const dbRoutes = require('./routes/db');       // new db routes (upload & execute)
+const chatRoutes = require('./routes/chat');
 const rateLimit = require('express-rate-limit');
 const { ipKeyGenerator } = require('express-rate-limit');
 const responseTime = require('response-time');
@@ -46,7 +47,8 @@ app.use(helmet());
 
 // Routes
 app.use('/api/auth', authRoutes);
-app.use('/api/query', queryRoutes);
+app.use('/api/query', queryRoutes); // main existing query routes stay here
+app.use('/api/db', dbRoutes);       // new DB routes for upload & execute
 app.use('/api/chat', chatRoutes);
 
 // Health check
@@ -64,14 +66,15 @@ mongoose.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
     process.on('SIGINT', async () => {
       console.log('Shutting down...');
       await mongoose.disconnect();
-     process.exit(0);
-   });
+      process.exit(0);
+    });
   })
   .catch(err => {
     console.error('Mongo connection error:', err);
     process.exit(1);
   });
 
+// Error handler
 app.use((err, req, res, next) => {
   console.error(err.stack);
   res.status(500).json({ error: 'Internal server error', message: err.message });
