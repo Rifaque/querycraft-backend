@@ -2,10 +2,11 @@
 const axios = require('axios');
 const { parseLLMResponseText } = require('../utils/responseParser');
 
-const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
-const OPENAI_KEY = process.env.OPENAI_API_KEY;
 const LLM_ENDPOINT = process.env.LLM_ENDPOINT || 'http://127.0.0.1:11434/api/generate';
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'mistral:7b-instruct';
+
+// If you prefer a different env name for Gemini set it here:
+const GENAI_KEY = process.env.GENAI_KEY || process.env.GOOGLE_GENAI_KEY || null;
 
 // Simple whitelist / mapping to avoid arbitrary model strings from client
 const MODEL_MAP = {
@@ -15,7 +16,11 @@ const MODEL_MAP = {
   'qwen4': 'qwen:4b',
   'qwen:4b': 'qwen:4b',
   'llama1b': 'llama3.2:1b',
-  'llama3.2:1b': 'llama3.2:1b'
+  'llama3.2:1b': 'llama3.2:1b',
+  'gemini': 'gemini-1.5-pro',
+  'gemini-1.5-pro': 'gemini-1.5-pro',
+  'gemini-2.5-flash': 'gemini-2.5-flash',
+  'gemini-2.5-pro': 'gemini-2.5-pro',
 };
 
 function normalizeModel(input) {
@@ -27,10 +32,34 @@ function normalizeModel(input) {
   return DEFAULT_MODEL;
 }
 
+// small helper sleep
+function sleep(ms) {
+  return new Promise((res) => setTimeout(res, ms));
+}
+
+// decide whether an error is transient and should be retried
+function isTransientGeminiError(err) {
+  if (!err) return false;
+
+  // axios-style http status
+  const status = err?.response?.status || err?.statusCode || null;
+  if (status === 429 || status === 503 || (status >= 500 && status < 600)) return true;
+
+  // some SDKs embed an error code or message
+  const msg = String(err?.message || '').toLowerCase();
+  if (msg.includes('overload') || msg.includes('overloaded') || msg.includes('unavailable') || msg.includes('temporarily')) return true;
+  if (String(err?.code || '').toUpperCase() === 'ETIMEDOUT' || String(err?.code || '').toUpperCase() === 'ECONNRESET') return true;
+
+  // Google GenAI error shape could include error.status
+  if (err?.error?.status === 'UNAVAILABLE' || err?.error?.code === 503) return true;
+
+  return false;
+}
+
 /**
- * Query LLM. If LLM_ENDPOINT is set (default points to local Ollama),
- * it will POST { prompt, model, max_tokens, temperature } to that url.
- * Otherwise falls back to OpenAI Chat Completions.
+ * Query LLM. Priority:
+ * 1. If chosen model is Gemini -> use Google GenAI (requires GENAI_KEY).
+ * 2. Else -> call local endpoint (LLM_ENDPOINT).
  *
  * Returns { text, raw, usage, sql? }
  */
@@ -43,26 +72,19 @@ async function queryLLM({ prompt, model = null, max_tokens = 512, temperature = 
   function extractPossibleTextFromRaw(raw) {
     if (raw == null) return '';
 
-    // If raw is already a string, that's candidate (may be JSON-encoded)
     if (typeof raw === 'string') return raw;
 
-    // Common top-level fields
     if (typeof raw.text === 'string') return raw.text;
     if (typeof raw.response === 'string') return raw.response;
     if (typeof raw.output === 'string') return raw.output;
     if (typeof raw.result === 'string') return raw.result;
 
-    // Some endpoints return { data: { text: '...' } }
     if (raw.data && typeof raw.data.text === 'string') return raw.data.text;
 
-    // OpenAI-style choices
     if (raw.choices && Array.isArray(raw.choices) && raw.choices.length > 0) {
       const c = raw.choices[0];
-      // Chat-style message
       if (c.message && typeof c.message.content === 'string') return c.message.content;
-      // text field
       if (typeof c.text === 'string') return c.text;
-      // sometimes message.content is array blocks
       if (c?.message?.content && Array.isArray(c.message.content)) {
         for (const block of c.message.content) {
           if (typeof block === 'string') return block;
@@ -71,17 +93,23 @@ async function queryLLM({ prompt, model = null, max_tokens = 512, temperature = 
       }
     }
 
-    // Some endpoints return output as array of blocks
-    if (Array.isArray(raw.output) && raw.output.length) {
-      // join textual blocks
-      try {
-        return raw.output.map(o => (typeof o === 'string' ? o : (o?.text || ''))).join('\n');
-      } catch (e) {
-        // fallback
+    if (Array.isArray(raw.candidates) && raw.candidates.length > 0) {
+      const cand = raw.candidates[0];
+      if (typeof cand === 'string') return cand;
+      if (cand?.content && typeof cand.content === 'string') return cand.content;
+      if (cand?.content && Array.isArray(cand.content)) {
+        for (const part of cand.content) {
+          if (part?.text) return part.text;
+        }
       }
     }
 
-    // Fallback: stringify some part of raw (limited)
+    if (Array.isArray(raw.output) && raw.output.length) {
+      try {
+        return raw.output.map(o => (typeof o === 'string' ? o : (o?.text || ''))).join('\n');
+      } catch (e) {}
+    }
+
     try {
       return JSON.stringify(raw).slice(0, 20000);
     } catch (e) {
@@ -89,70 +117,100 @@ async function queryLLM({ prompt, model = null, max_tokens = 512, temperature = 
     }
   }
 
-  if (LLM_ENDPOINT) {
-    try {
-      const payload = {
-        model: chosenModel,
-        prompt,
-        max_tokens,
-        temperature,
-        stream: false
-      };
-
-      const resp = await axios.post(LLM_ENDPOINT, payload, {
-        timeout: 120000,
-        headers: {
-          'Content-Type': 'application/json'
-        }
-      });
-
-      const raw = resp.data;
-      const possible = extractPossibleTextFromRaw(raw);
-
-      // parse & clean the textual content (extract response body, strip fences, pull SQL)
-      const { cleanedText, sql } = parseLLMResponseText(possible, raw);
-
-      const usage = raw?.usage || null;
-      return { text: cleanedText || possible || '', raw, usage, sql: sql || null };
-    } catch (err) {
-      const msg = err?.response?.data ? JSON.stringify(err.response.data).slice(0, 1000) : err.message;
-      const e = new Error(`LLM endpoint error: ${msg}`);
-      e.cause = err;
-      throw e;
+  // === If chosen model is Gemini -> use Google GenAI ===
+  if (/^gemini/i.test(chosenModel) || chosenModel.toLowerCase().includes('gemini')) {
+    if (!GENAI_KEY) {
+      throw new Error('Gemini model requested but no GENAI_KEY is configured in env.');
     }
+
+    // retry config - tweak via env if you want
+    const GEMINI_RETRIES = Number(process.env.GEMINI_RETRIES || 3); // total attempts
+    const GEMINI_BASE_DELAY = Number(process.env.GEMINI_BASE_DELAY_MS || 500); // ms
+    const GEMINI_MAX_BACKOFF = Number(process.env.GEMINI_MAX_BACKOFF_MS || 5000); // ms
+
+    // dynamic import so package is loaded only when used
+    const { GoogleGenAI } = await import('@google/genai');
+    const ai = new GoogleGenAI({ apiKey: GENAI_KEY });
+
+    let lastErr = null;
+    for (let attempt = 1; attempt <= GEMINI_RETRIES; attempt++) {
+      try {
+        const resp = await ai.models.generateContent({
+          model: chosenModel,
+          // Many GenAI SDKs accept 'contents' or 'input'; using 'contents' here.
+          contents: prompt,
+          temperature,
+          maxOutputTokens: max_tokens
+        });
+
+        const raw = resp;
+        const possible = extractPossibleTextFromRaw(raw);
+
+        const { cleanedText, sql } = parseLLMResponseText(possible, raw);
+        const usage = raw?.usage || raw?.metadata || null;
+
+        return { text: cleanedText || possible || '', raw, usage, sql: sql || null };
+      } catch (err) {
+        lastErr = err;
+
+        // if this is last attempt, break and throw below
+        if (attempt >= GEMINI_RETRIES || !isTransientGeminiError(err)) {
+          break;
+        }
+
+        // exponential backoff with jitter
+        const exp = Math.min(GEMINI_BASE_DELAY * Math.pow(2, attempt - 1), GEMINI_MAX_BACKOFF);
+        const jitter = Math.floor(Math.random() * Math.max(100, Math.floor(exp * 0.25))); // up to 25% jitter
+        const wait = exp + jitter;
+
+        // small console log for visibility in server logs
+        try {
+          console.warn(`Gemini request failed (attempt ${attempt}/${GEMINI_RETRIES}) — retrying in ${wait}ms:`, (err?.response?.status || err?.statusCode || err?.message) );
+        } catch (e) {}
+
+        await sleep(wait);
+        // continue to next attempt
+      }
+    }
+
+    // after retries, throw with the original error attached
+    const msg = lastErr?.message || 'Unknown Gemini error';
+    const e = new Error(`Gemini (GenAI) request error: ${msg}`);
+    e.cause = lastErr;
+    throw e;
   }
 
-  // Fallback to OpenAI Chat Completions
-  if (!OPENAI_KEY) throw new Error('No LLM endpoint configured (set LLM_ENDPOINT or OPENAI_API_KEY)');
+  // === Otherwise: use local LLM endpoint ===
+  if (!LLM_ENDPOINT) {
+    throw new Error('No local LLM endpoint configured (set LLM_ENDPOINT).');
+  }
 
   try {
-    const body = {
-      model: normalizeModel(model),
-      messages: [
-        { role: 'system', content: 'You are a helpful assistant.' },
-        { role: 'user', content: prompt }
-      ],
+    const payload = {
+      model: chosenModel,
+      prompt,
       max_tokens,
-      temperature
+      temperature,
+      stream: false
     };
 
-    const resp = await axios.post(OPENAI_URL, body, {
+    const resp = await axios.post(LLM_ENDPOINT, payload, {
+      timeout: 120000,
       headers: {
-        Authorization: `Bearer ${OPENAI_KEY}`,
         'Content-Type': 'application/json'
-      },
-      timeout: 120000
+      }
     });
 
     const raw = resp.data;
     const possible = extractPossibleTextFromRaw(raw);
+
     const { cleanedText, sql } = parseLLMResponseText(possible, raw);
 
     const usage = raw?.usage || null;
     return { text: cleanedText || possible || '', raw, usage, sql: sql || null };
   } catch (err) {
     const msg = err?.response?.data ? JSON.stringify(err.response.data).slice(0, 1000) : err.message;
-    const e = new Error(`OpenAI request error: ${msg}`);
+    const e = new Error(`LLM endpoint error: ${msg}`);
     e.cause = err;
     throw e;
   }
