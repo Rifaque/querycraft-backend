@@ -40,6 +40,49 @@ function looksLikeMongo(s) {
   return /db\.\w+\.(find|aggregate|insert|update|remove)\s*\(/i.test(s) || /collection\(['"`]\w+['"`]\)/i.test(s);
 }
 
+// Very rough structural heuristics for other DB query syntaxes
+function looksLikeCypher(s) {
+  if (!s) return false;
+  return /\bMATCH\s*\(/i.test(s) || /\bMERGE\s*\(/i.test(s) || (/\bCREATE\s*\(/i.test(s) && /-\[[^\]]*\]->\(/.test(s));
+}
+
+function looksLikeGraphQL(s) {
+  if (!s) return false;
+  return (
+    /^\s*(query|mutation|subscription)\b[\s\S]*\{/i.test(s) ||
+    /^\s*\{\s*[A-Za-z0-9_]+\s*\{/m.test(s)
+  );
+}
+
+/**
+ * Try to infer which DB language the user WANTS, based on hints in the text.
+ * This is broader than "looksLike<Lang>" – it also considers natural language hints.
+ *
+ * Returns one of:
+ *   'sql', 'mongodb', 'cypher', 'graphql', 'cql', 'redis', 'elasticsearch', 'dynamodb', etc.
+ * or null if no strong hint.
+ */
+function detectQueryLanguageHint(s) {
+  if (!s) return null;
+  const lower = s.toLowerCase();
+
+  // Explicit language mentions take priority
+  if (/\bcypher\b/.test(lower) || /\bneo4j\b/.test(lower)) return 'cypher';
+  if (/\bgraphql\b/.test(lower) || /\bgql\b/.test(lower)) return 'graphql';
+  if (/\bcassandra\b/.test(lower) || /\bcql\b/.test(lower)) return 'cql';
+  if (/\bredis\b/.test(lower)) return 'redis';
+  if (/\bdynamodb\b/.test(lower)) return 'dynamodb';
+  if (/\belasticsearch\b/.test(lower) || /\bes index\b/.test(lower)) return 'elasticsearch';
+
+  // Structural hints (if user pasted a query without naming the language)
+  if (looksLikeMongo(s)) return 'mongodb';
+  if (looksLikeSQL(s)) return 'sql';
+  if (looksLikeCypher(s)) return 'cypher';
+  if (looksLikeGraphQL(s)) return 'graphql';
+
+  return null;
+}
+
 function buildGuidedPrompt(
   userPrompt,
   isUserQuery = false,
@@ -47,11 +90,13 @@ function buildGuidedPrompt(
   chatHistoryText = ''
 ) {
   const instructionHeader = [
-    "You are an expert assistant for generating and explaining database queries (SQL and MongoDB).",
+    "You are an expert assistant for generating and explaining database queries.",
+    "You can work with SQL, MongoDB, and other database query languages such as Cypher (Neo4j), GraphQL, Cassandra CQL, Redis, Elasticsearch DSL, etc.",
     "",
     "CRITICAL QUERY GENERATION RULES:",
     "",
     "• You must produce a SINGLE executable query, not multiple statements.",
+    "",
     "• When generating SQL:",
     "  - Use standard ANSI-style SQL that works on Postgres/MySQL/SQLite.",
     "  - Do NOT include comments inside the SQL (no -- or /* */).",
@@ -65,16 +110,23 @@ function buildGuidedPrompt(
     "  - Do NOT assign the result to a variable (no const result = ...).",
     "  - Use plain JavaScript/JSON-style objects for filters (no arrow functions, no TypeScript).",
     "",
-    "• Choosing SQL vs MongoDB:",
+    "• When generating queries in OTHER database languages (Cypher, GraphQL, CQL, Redis, etc.):",
+    "  - Use idiomatic, executable syntax for that language.",
+    "  - Do NOT wrap the query in variables or client-library boilerplate.",
+    "  - Do NOT include comments inside the query.",
+    "",
+    "• Choosing the query language:",
+    "  - If the user explicitly mentions a specific language (e.g. 'in Cypher', 'Neo4j', 'GraphQL', 'CQL', 'Redis'), you MUST answer in that language.",
     "  - If the user or prior context explicitly mentions MongoDB, collections, documents, or db.<name>, use MongoDB.",
-    "  - If the user or context explicitly mentions tables, SQL, Postgres, MySQL, SQLite, or uses SELECT/INSERT/UPDATE/DELETE, use SQL.",
-    "  - If it is ambiguous, DEFAULT TO SQL.",
+    "  - If the user or prior context explicitly mentions tables, SQL, Postgres, MySQL, SQLite, or uses SELECT/INSERT/UPDATE/DELETE, use SQL.",
+    "  - If the type hint is 'sql_or_mongo' and the request is ambiguous, choose between SQL and MongoDB following the rules above; DEFAULT TO SQL when still unclear.",
     "",
     "OUTPUT FORMAT (MUST ALWAYS BE FOLLOWED):",
     "1) The first line must start with: Here's the query",
     "2) Immediately after that, include ONLY the query in fenced code block(s):",
     "   - Use ```sql for SQL queries.",
     "   - Use ```mongodb for MongoDB queries.",
+    "   - Use language-appropriate fences for others, e.g. ```cypher, ```graphql, ```cql, ```redis, ```elasticsearch, etc.",
     "   Example for SQL:",
     "   ```sql",
     "   SELECT ...;",
@@ -86,12 +138,12 @@ function buildGuidedPrompt(
     "   Inside the code block, include ONLY the raw query (no comments, no explanation).",
     "3) After the fenced block(s), provide a clear explanation of:",
     "   - What the query does.",
-    "   - Which tables/collections/fields it touches.",
+    "   - Which tables/collections/fields or entities it touches.",
     "   - Any assumptions.",
     "   - Any potential performance or security issues if applicable.",
     "",
-    "If the user already provided a query (SQL or MongoDB), DO NOT generate a different query:",
-    "  - Show the exact provided query in a fenced block with the correct language (```sql or ```mongodb).",
+    "If the user already provided a query (in any database language), DO NOT generate a different query:",
+    "  - Show the exact provided query in a fenced block with the correct language (```sql, ```mongodb, ```cypher, ```graphql, etc. if you can infer it).",
     "  - Then explain that query as described above.",
     "",
     "Keep answers concise, readable, and developer-friendly.",
@@ -113,7 +165,15 @@ function buildGuidedPrompt(
     ].join("\\n");
   }
 
-  const typeHintLine = `Current request type hint: ${queryType}. If this is 'sql_or_mongo', apply the rules above to choose the most appropriate type (default to SQL when unclear).`;
+  const typeHintLine =
+    queryType === 'sql_or_mongo'
+      ? "Current request type hint: sql_or_mongo. Choose between SQL and MongoDB using the rules above (default to SQL when unclear)."
+      : `Current request type hint: ${queryType}. You MUST answer using this query language.`;
+
+  const generationInstruction =
+    queryType === 'sql_or_mongo'
+      ? "User request (generate an appropriate SQL or MongoDB query from this request, then show the query and explain):"
+      : `User request (generate an appropriate ${queryType} query from this request, then show the query and explain):`;
 
   if (isUserQuery) {
     return [
@@ -133,7 +193,7 @@ function buildGuidedPrompt(
       typeHintLine,
       "",
       historySection,
-      `User request (generate an appropriate ${queryType} query from this request, then show the query and explain):`,
+      generationInstruction,
       "",
       sanitized,
       "",
@@ -194,7 +254,8 @@ function enforceOutputFormat(llmText, originalPrompt, originalWasQuery) {
 
     // If the original prompt was itself the query, prefer showing that query and the model explanation.
     if (originalWasQuery) {
-      return `Here's the query\n\n\`\`\`${looksLikeMongo(originalPrompt) ? 'mongodb' : 'sql'}\n${originalPrompt.trim()}\n\`\`\`\n\nExplanation:\n${llmText.trim() || 'No explanation provided.'}`;
+      const langHint = detectQueryLanguageHint(originalPrompt) || (looksLikeMongo(originalPrompt) ? 'mongodb' : 'sql');
+      return `Here's the query\n\n\`\`\`${langHint}\n${originalPrompt.trim()}\n\`\`\`\n\nExplanation:\n${llmText.trim() || 'No explanation provided.'}`;
     }
 
     // Fallback: wrap the whole model reply as the explanation and leave a placeholder for the query.
@@ -247,12 +308,14 @@ router.post('/', limiter, auth, async (req, res) => {
     const cleaned = sanitizePrompt(rawPrompt);
     if (!cleaned) return res.status(400).json({ error: 'Prompt is required' });
 
-    // Determine whether the user's prompt already *is* a query (SQL or Mongo)
+    // Determine whether the user's prompt already *is* a query (in any supported language)
     const isSQLQuery = looksLikeSQL(cleaned);
     const isMongoQuery = looksLikeMongo(cleaned);
-    const originalWasQuery = isSQLQuery || isMongoQuery;
+    const isCypherQuery = looksLikeCypher(cleaned);
+    const isGraphQLQuery = looksLikeGraphQL(cleaned);
+    const originalWasQuery = isSQLQuery || isMongoQuery || isCypherQuery || isGraphQLQuery;
 
-        // Ensure chat exists (only that it belongs to the user)
+    // Ensure chat exists (only that it belongs to the user)
     let chat = null;
     if (chatId) {
       chat = await Chat.findOne({ _id: chatId, user: userId });
@@ -281,13 +344,31 @@ router.post('/', limiter, auth, async (req, res) => {
       createdAt: new Date()
     });
 
-    // Build the guided prompt for the LLM, now with history context
+    // Decide which query language to guide the LLM towards
+    const langHint = detectQueryLanguageHint(cleaned);
+    let queryTypeHint;
+
+    if (langHint) {
+      // Explicit language requested (cypher, graphql, cql, redis, etc.) or confidently inferred
+      queryTypeHint = langHint;
+    } else if (isMongoQuery) {
+      queryTypeHint = 'mongodb';
+    } else if (isSQLQuery) {
+      queryTypeHint = 'sql';
+    } else {
+      // Ambiguous: let the model choose between SQL and MongoDB, with SQL as default
+      queryTypeHint = 'sql_or_mongo';
+    }
+
+    // Build the guided prompt for the LLM, now with history context and multi-language support
     const guidedPrompt = buildGuidedPrompt(
       cleaned,
       originalWasQuery,
-      (isMongoQuery ? 'mongodb' : 'sql_or_mongo'),
+      queryTypeHint,
       chatHistoryText
     );
+
+    console.log(guidedPrompt); // for debugging
 
     // Call LLM (synchronous) – still single string prompt
     const llmResult = await queryLLM({
@@ -361,7 +442,9 @@ router.post('/demo', limiter, async (req, res) => {
 
     const isSQLQuery = looksLikeSQL(cleaned);
     const isMongoQuery = looksLikeMongo(cleaned);
-    const originalWasQuery = isSQLQuery || isMongoQuery;
+    const isCypherQuery = looksLikeCypher(cleaned);
+    const isGraphQLQuery = looksLikeGraphQL(cleaned);
+    const originalWasQuery = isSQLQuery || isMongoQuery || isCypherQuery || isGraphQLQuery;
 
     // default demo model -> llama3.2:1b (will be normalized in queryLLM)
     const modelParam = model || 'llama3.2:1b';
@@ -369,10 +452,12 @@ router.post('/demo', limiter, async (req, res) => {
     // Build a much stricter guided prompt: only produce the query text.
     // If ambiguous, the model MUST output exactly the token AMBIGUOUS_PROMPT (no extra text).
     const strictGuidance = [
-      "You are an expert assistant that generates a single database query (SQL or MongoDB) from a user's natural language request.",
+      "You are an expert assistant that generates a single database query from a user's natural language request.",
+      "You can generate SQL, MongoDB queries, or other database query languages such as Cypher (Neo4j), GraphQL, Cassandra CQL, Redis, Elasticsearch DSL, etc.",
       "CRITICAL: Output ONLY the query text and NOTHING ELSE. Do NOT output any explanation, JSON, or surrounding text. Do NOT use code fences.",
       "If the correct output is an SQL query, output the SQL statement ending with a semicolon. Example: SELECT id FROM users;",
       "If the correct output is a MongoDB shell/driver statement, output the mongo command (e.g. db.users.find({...})) exactly.",
+      "If the correct output is Cypher, GraphQL, CQL, or another DB language explicitly requested by the user, output a single valid query in that language.",
       "If the user's prompt is ambiguous or does not provide enough information to create an unambiguous query, DO NOT attempt to guess. Instead output exactly the single token: AMBIGUOUS_PROMPT",
       "Do NOT add extra filters, ORDER BY, LIMIT, JOINs, or inferred conditions unless explicitly requested by the user.",
       "",
@@ -396,20 +481,26 @@ router.post('/demo', limiter, async (req, res) => {
     const formattedOrRaw = llmCall?.formatted || answerStringRaw;
 
     // Helper: extract only the query portion (keeps compatibility with any model noise)
-    function extractQueryOnly(formattedOrRaw, rawText) {
-      const candidate = String(formattedOrRaw || rawText || '').trim();
+    function extractQueryOnly(formattedOrRawValue, rawText) {
+      const candidate = String(formattedOrRawValue || rawText || '').trim();
       if (!candidate) return '';
 
       // If the model obeyed instructions, it may have returned "AMBIGUOUS_PROMPT"
       if (/^\s*AMBIGUOUS_PROMPT\s*$/i.test(candidate)) return 'AMBIGUOUS_PROMPT';
 
-      // 1) If the candidate contains only a single line and looks like SQL or mongo, return it
-      if (/^(SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|WITH)\b/i.test(candidate) || /^db\./i.test(candidate)) {
+      // 1) If the candidate contains only a single line and looks like a known query, return it
+      if (
+        /^(SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|WITH)\b/i.test(candidate) || // SQL
+        /^db\./i.test(candidate) ||                                                 // Mongo
+        /^\s*MATCH\b/i.test(candidate) ||                                           // Cypher
+        /^\s*(query|mutation|subscription)\b/i.test(candidate) ||                   // GraphQL
+        /^\s*\{\s*[A-Za-z0-9_]+\s*\{/i.test(candidate)                              // GraphQL shorthand
+      ) {
         return candidate;
       }
 
       // 2) Look for fenced codeblocks (robustness): extract inner content
-      const fence = candidate.match(/```(?:sql|mongodb|query)?\n([\s\S]*?)\n```/i);
+      const fence = candidate.match(/```(?:sql|mongodb|cypher|graphql|cql|redis|elasticsearch|query)?\n([\s\S]*?)\n```/i);
       if (fence) return fence[1].trim();
 
       // 3) Extract SQL snippet ending in semicolon
@@ -433,6 +524,9 @@ router.post('/demo', limiter, async (req, res) => {
       // has SQL keywords or mongo prefix or ends with semicolon (common heuristics)
       if (/^(SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|WITH)\b/i.test(q)) return true;
       if (/^db\./i.test(q)) return true;
+      if (/^\s*MATCH\b/i.test(q)) return true; // Cypher
+      if (/^\s*(query|mutation|subscription)\b/i.test(q)) return true; // GraphQL
+      if (/^\s*\{\s*[A-Za-z0-9_]+\s*\{/i.test(q)) return true; // GraphQL shorthand
       if (/;$/i.test(q)) return true;
       return false;
     };
