@@ -40,36 +40,105 @@ function looksLikeMongo(s) {
   return /db\.\w+\.(find|aggregate|insert|update|remove)\s*\(/i.test(s) || /collection\(['"`]\w+['"`]\)/i.test(s);
 }
 
-function buildGuidedPrompt(userPrompt, isUserQuery = false, queryType = 'sql_or_mongo') {
-  // keep instructions explicit and prescriptive
+function buildGuidedPrompt(
+  userPrompt,
+  isUserQuery = false,
+  queryType = 'sql_or_mongo',
+  chatHistoryText = ''
+) {
   const instructionHeader = [
     "You are an expert assistant for generating and explaining database queries (SQL and MongoDB).",
-    "Always follow this exact output pattern:",
-    "1) First line must start with: Here's the query",
-    "2) Immediately after that, include the query in fenced code block(s). Use ```sql for SQL and ```query or ```mongodb for MongoDB, e.g.:",
+    "",
+    "CRITICAL QUERY GENERATION RULES:",
+    "",
+    "• You must produce a SINGLE executable query, not multiple statements.",
+    "• When generating SQL:",
+    "  - Use standard ANSI-style SQL that works on Postgres/MySQL/SQLite.",
+    "  - Do NOT include comments inside the SQL (no -- or /* */).",
+    "  - Do NOT wrap the SQL in quotes or assign it to a variable.",
+    "  - Do NOT include placeholders like <table_name> or <column>; use concrete names from the user or from context.",
+    "  - Output exactly one complete SQL statement that ends with a semicolon.",
+    "",
+    "• When generating MongoDB queries:",
+    "  - Prefer the form: db.<collection>.find({ ... }) or db.<collection>.aggregate([ ... ])",
+    "  - Do NOT append .pretty(), .toArray(), or other chained methods after the find/aggregate call.",
+    "  - Do NOT assign the result to a variable (no const result = ...).",
+    "  - Use plain JavaScript/JSON-style objects for filters (no arrow functions, no TypeScript).",
+    "",
+    "• Choosing SQL vs MongoDB:",
+    "  - If the user or prior context explicitly mentions MongoDB, collections, documents, or db.<name>, use MongoDB.",
+    "  - If the user or context explicitly mentions tables, SQL, Postgres, MySQL, SQLite, or uses SELECT/INSERT/UPDATE/DELETE, use SQL.",
+    "  - If it is ambiguous, DEFAULT TO SQL.",
+    "",
+    "OUTPUT FORMAT (MUST ALWAYS BE FOLLOWED):",
+    "1) The first line must start with: Here's the query",
+    "2) Immediately after that, include ONLY the query in fenced code block(s):",
+    "   - Use ```sql for SQL queries.",
+    "   - Use ```mongodb for MongoDB queries.",
+    "   Example for SQL:",
     "   ```sql",
     "   SELECT ...;",
     "   ```",
-    "   or",
+    "   Example for MongoDB:",
     "   ```mongodb",
     "   db.users.find({ ... })",
     "   ```",
-    "3) After the fenced block(s), provide a clear explanation of what the query does, what tables/collections/fields it touches, any assumptions, and any potential issues (indexes, performance, security) if applicable.",
+    "   Inside the code block, include ONLY the raw query (no comments, no explanation).",
+    "3) After the fenced block(s), provide a clear explanation of:",
+    "   - What the query does.",
+    "   - Which tables/collections/fields it touches.",
+    "   - Any assumptions.",
+    "   - Any potential performance or security issues if applicable.",
     "",
-    "If the user already provided a query (SQL or MongoDB), DO NOT generate a different query — explain the provided query using the same format: show the query (fenced) and then explanation.",
+    "If the user already provided a query (SQL or MongoDB), DO NOT generate a different query:",
+    "  - Show the exact provided query in a fenced block with the correct language (```sql or ```mongodb).",
+    "  - Then explain that query as described above.",
     "",
     "Keep answers concise, readable, and developer-friendly.",
     ""
-  ].join("\n");
+  ].join("\\n");
 
   const sanitized = escapeBackticks(userPrompt);
 
+  let historySection = '';
+  if (chatHistoryText && chatHistoryText.trim()) {
+    historySection = [
+      "Here is the prior conversation context (earlier user questions and assistant answers).",
+      "Use it as context, but focus your answer on the latest user input.",
+      "",
+      chatHistoryText,
+      "",
+      "End of prior context.",
+      ""
+    ].join("\\n");
+  }
+
+  const typeHintLine = `Current request type hint: ${queryType}. If this is 'sql_or_mongo', apply the rules above to choose the most appropriate type (default to SQL when unclear).`;
+
   if (isUserQuery) {
-    // ask the model to explain the exact query given by the user
-    return `${instructionHeader}\n\nUser-supplied query (explain this as-is):\n\n${sanitized}\n\nRespond now.`;
+    return [
+      instructionHeader,
+      typeHintLine,
+      "",
+      historySection,
+      "User-supplied query (explain this as-is):",
+      "",
+      sanitized,
+      "",
+      "Respond now."
+    ].join("\\n");
   } else {
-    // user asked in natural language: create a query and then explain it
-    return `${instructionHeader}\n\nUser request (generate an appropriate ${queryType} query from this request, then show the query and explain):\n\n${sanitized}\n\nRespond now.`;
+    return [
+      instructionHeader,
+      typeHintLine,
+      "",
+      historySection,
+      `User request (generate an appropriate ${queryType} query from this request, then show the query and explain):`,
+      "",
+      sanitized,
+      "",
+      "Respond now."
+    ].join("\\n");
   }
 }
 
@@ -136,6 +205,25 @@ function enforceOutputFormat(llmText, originalPrompt, originalWasQuery) {
   }
 }
 
+function buildChatHistoryText(previousQueries, maxPairs = 8) {
+  if (!previousQueries || !previousQueries.length) return '';
+
+  const doneOnly = previousQueries.filter(q => q.status === 'done');
+  const last = doneOnly.slice(-maxPairs);
+
+  const lines = [];
+  for (const q of last) {
+    if (q.prompt) {
+      lines.push(`User: ${q.prompt}`);
+    }
+    if (q.response) {
+      lines.push(`Assistant: ${q.response}`);
+    }
+  }
+
+  return lines.join("\n\n");
+}
+
 /**
  * POST /api/query
  * Body: { chatId, prompt, model?, max_tokens?, temperature? }
@@ -164,7 +252,7 @@ router.post('/', limiter, auth, async (req, res) => {
     const isMongoQuery = looksLikeMongo(cleaned);
     const originalWasQuery = isSQLQuery || isMongoQuery;
 
-    // Ensure chat exists (only that it belongs to the user)
+        // Ensure chat exists (only that it belongs to the user)
     let chat = null;
     if (chatId) {
       chat = await Chat.findOne({ _id: chatId, user: userId });
@@ -172,6 +260,16 @@ router.post('/', limiter, auth, async (req, res) => {
     } else {
       chat = await Chat.create({ user: userId, title: cleaned.slice(0, 50) || 'New Chat' });
     }
+
+    // 👉 Fetch previous queries for this chat (all prior turns)
+    const previousQueries = await Query.find({
+      chat: chat._id,
+      user: userId
+    })
+      .sort({ createdAt: 1 })
+      .lean();
+
+    const chatHistoryText = buildChatHistoryText(previousQueries);
 
     // Create pending Query record so frontend can reference it immediately if needed
     saved = await Query.create({
@@ -183,10 +281,15 @@ router.post('/', limiter, auth, async (req, res) => {
       createdAt: new Date()
     });
 
-    // Build the guided prompt for the LLM
-    const guidedPrompt = buildGuidedPrompt(cleaned, originalWasQuery, (isMongoQuery ? 'mongodb' : 'sql_or_mongo'));
+    // Build the guided prompt for the LLM, now with history context
+    const guidedPrompt = buildGuidedPrompt(
+      cleaned,
+      originalWasQuery,
+      (isMongoQuery ? 'mongodb' : 'sql_or_mongo'),
+      chatHistoryText
+    );
 
-    // Call LLM (synchronous)
+    // Call LLM (synchronous) – still single string prompt
     const llmResult = await queryLLM({
       prompt: guidedPrompt,
       model,

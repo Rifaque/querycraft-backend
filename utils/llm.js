@@ -195,7 +195,7 @@ async function queryLLM({ prompt, model = null, max_tokens = 512, temperature = 
     };
 
     const resp = await axios.post(LLM_ENDPOINT, payload, {
-      timeout: 120000,
+      timeout: 300000,
       headers: {
         'Content-Type': 'application/json'
       }
