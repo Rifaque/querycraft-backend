@@ -8,11 +8,16 @@ const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'mistral:7b-instruct';
 // If you prefer a different env name for Gemini set it here:
 const GENAI_KEY = process.env.GENAI_KEY || process.env.GOOGLE_GENAI_KEY || null;
 
+// OpenRouter config
+const OPENROUTER_KEY = process.env.OPENROUTER_KEY || null;
+const OPENROUTER_SITE_URL = process.env.OPENROUTER_SITE_URL || 'https://localhost';
+const OPENROUTER_APP_NAME = process.env.OPENROUTER_APP_NAME || 'QueryCraft';
+
 // Simple whitelist / mapping to avoid arbitrary model strings from client
 const MODEL_MAP = {
-  'mistral': 'mistral:7b-instruct',
-  'mistral:7b-instruct': 'mistral:7b-instruct',
-  'mistral:7b': 'mistral:7b-instruct',
+  'mistral': 'openrouter:mistralai/mistral-7b-instruct:free',
+  'mistral:7b-instruct': 'openrouter:mistralai/mistral-7b-instruct:free',
+  'mistral:7b': 'openrouter:mistralai/mistral-7b-instruct:free',
 
   'qwen4': 'qwen:4b',
   'qwen:4b': 'qwen:4b',
@@ -29,8 +34,16 @@ const MODEL_MAP = {
   'phi3-mini': 'phi3:mini-4k-instruct',
   'phi3-mini-4k-instruct': 'phi3:mini-4k-instruct',
   'phi3:mini-4k-instruct': 'phi3:mini-4k-instruct',
-};
 
+  // OpenRouter aliases (you can adjust / add more)
+  // Frontend should send one of these keys, not the raw openrouter: string
+  'or-deepseek-r1': 'openrouter:deepseek/deepseek-r1',
+  'or-qwen2.5-72b-free': 'openrouter:qwen/qwen-2.5-72b-instruct:free',
+  'or-grok-code-fast': 'openrouter:x-ai/grok-code-fast-1',
+  'or-grok-4.1-fast': 'openrouter:x-ai/grok-4.1-fast:free',
+  'or-qwen3-235b-a22b': 'openrouter:qwen/qwen3-235b-a22b:free',
+  'or-qwen3-coder': 'openrouter:qwen/qwen3-coder:free',
+};
 
 function normalizeModel(input) {
   if (!input) return DEFAULT_MODEL;
@@ -38,6 +51,7 @@ function normalizeModel(input) {
   if (MODEL_MAP[key]) return MODEL_MAP[key];
   const lower = key.toLowerCase();
   if (MODEL_MAP[lower]) return MODEL_MAP[lower];
+  // unknown model → fall back to default to keep whitelist behaviour
   return DEFAULT_MODEL;
 }
 
@@ -68,7 +82,8 @@ function isTransientGeminiError(err) {
 /**
  * Query LLM. Priority:
  * 1. If chosen model is Gemini -> use Google GenAI (requires GENAI_KEY).
- * 2. Else -> call local endpoint (LLM_ENDPOINT).
+ * 2. If chosen model is OpenRouter -> call OpenRouter API.
+ * 3. Else -> call local endpoint (LLM_ENDPOINT).
  *
  * Returns { text, raw, usage, sql? }
  */
@@ -76,6 +91,9 @@ async function queryLLM({ prompt, model = null, max_tokens = 512, temperature = 
   if (!prompt || !prompt.trim()) throw new Error('Empty prompt');
 
   const chosenModel = normalizeModel(model);
+  const lowerModel = chosenModel.toLowerCase();
+  const isGemini = /^gemini/i.test(chosenModel) || lowerModel.includes('gemini');
+  const isOpenRouter = chosenModel.startsWith('openrouter:');
 
   // Helper to try multiple places in the raw response for the "actual" text
   function extractPossibleTextFromRaw(raw) {
@@ -127,7 +145,7 @@ async function queryLLM({ prompt, model = null, max_tokens = 512, temperature = 
   }
 
   // === If chosen model is Gemini -> use Google GenAI ===
-  if (/^gemini/i.test(chosenModel) || chosenModel.toLowerCase().includes('gemini')) {
+  if (isGemini) {
     if (!GENAI_KEY) {
       throw new Error('Gemini model requested but no GENAI_KEY is configured in env.');
     }
@@ -174,7 +192,10 @@ async function queryLLM({ prompt, model = null, max_tokens = 512, temperature = 
 
         // small console log for visibility in server logs
         try {
-          console.warn(`Gemini request failed (attempt ${attempt}/${GEMINI_RETRIES}) — retrying in ${wait}ms:`, (err?.response?.status || err?.statusCode || err?.message) );
+          console.warn(
+            `Gemini request failed (attempt ${attempt}/${GEMINI_RETRIES}) — retrying in ${wait}ms:`,
+            (err?.response?.status || err?.statusCode || err?.message)
+          );
         } catch (e) {}
 
         await sleep(wait);
@@ -187,6 +208,56 @@ async function queryLLM({ prompt, model = null, max_tokens = 512, temperature = 
     const e = new Error(`Gemini (GenAI) request error: ${msg}`);
     e.cause = lastErr;
     throw e;
+  }
+
+  // === If chosen model is OpenRouter -> use OpenRouter API ===
+  if (isOpenRouter) {
+    if (!OPENROUTER_KEY) {
+      throw new Error('OpenRouter model requested but no OPENROUTER_KEY is configured in env.');
+    }
+
+    // strip the openrouter: prefix before sending to the API
+    const openRouterModel = chosenModel.replace(/^openrouter:/, '');
+
+    try {
+      const resp = await axios.post(
+        'https://openrouter.ai/api/v1/chat/completions',
+        {
+          model: openRouterModel,
+          max_tokens,
+          temperature,
+          messages: [
+            // You can add a system prompt if you want,
+            // but your "prompt" likely already includes instructions.
+            { role: 'user', content: prompt },
+          ],
+        },
+        {
+          timeout: 30000,
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${OPENROUTER_KEY}`,
+            'HTTP-Referer': OPENROUTER_SITE_URL,
+            'X-Title': OPENROUTER_APP_NAME,
+          },
+        }
+      );
+
+      const raw = resp.data;
+      const possible = extractPossibleTextFromRaw(raw);
+
+      const { cleanedText, sql } = parseLLMResponseText(possible, raw);
+      const usage = raw?.usage || null;
+
+      return { text: cleanedText || possible || '', raw, usage, sql: sql || null };
+    } catch (err) {
+      const msg = err?.response?.data
+        ? JSON.stringify(err.response.data).slice(0, 1000)
+        : err.message;
+      const e = new Error(`OpenRouter API error: ${msg}`);
+      e.cause = err;
+      throw e;
+    }
   }
 
   // === Otherwise: use local LLM endpoint ===
