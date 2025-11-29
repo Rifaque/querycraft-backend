@@ -13,15 +13,24 @@ const MODEL_MAP = {
   'mistral': 'mistral:7b-instruct',
   'mistral:7b-instruct': 'mistral:7b-instruct',
   'mistral:7b': 'mistral:7b-instruct',
+
   'qwen4': 'qwen:4b',
   'qwen:4b': 'qwen:4b',
+
   'llama1b': 'llama3.2:1b',
   'llama3.2:1b': 'llama3.2:1b',
+
   'gemini': 'gemini-1.5-pro',
   'gemini-1.5-pro': 'gemini-1.5-pro',
   'gemini-2.5-flash': 'gemini-2.5-flash',
   'gemini-2.5-pro': 'gemini-2.5-pro',
+
+  'phi3': 'phi3:mini-4k-instruct',
+  'phi3-mini': 'phi3:mini-4k-instruct',
+  'phi3-mini-4k-instruct': 'phi3:mini-4k-instruct',
+  'phi3:mini-4k-instruct': 'phi3:mini-4k-instruct',
 };
+
 
 function normalizeModel(input) {
   if (!input) return DEFAULT_MODEL;
@@ -195,7 +204,7 @@ async function queryLLM({ prompt, model = null, max_tokens = 512, temperature = 
     };
 
     const resp = await axios.post(LLM_ENDPOINT, payload, {
-      timeout: 300000,
+      timeout: 120000,
       headers: {
         'Content-Type': 'application/json'
       }

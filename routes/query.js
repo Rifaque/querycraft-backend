@@ -83,6 +83,48 @@ function detectQueryLanguageHint(s) {
   return null;
 }
 
+function chooseModelForPrompt(prompt, queryTypeHint, originalWasQuery, options = {}) {
+  const lower = (prompt || '').toLowerCase();
+  const { isDemo = false } = options;
+
+  // If user pasted an existing query and wants explanation, local is fine
+  if (originalWasQuery && prompt.length < 2000) {
+    // Prefer lightweight local for explanations
+    return 'llama3.2:1b';
+  }
+
+  // Prefer Gemini for long / explanation-heavy / very NL-heavy prompts
+  const wantsExplanation =
+    lower.includes('explain') ||
+    lower.includes('step by step') ||
+    lower.includes('detailed') ||
+    lower.includes('in detail') ||
+    lower.includes('what does this do');
+
+  if (prompt.length > 1200 || wantsExplanation) {
+    return 'gemini-1.5-pro';
+  }
+
+  // Mongo / NoSQL style stuff → qwen
+  if (
+    queryTypeHint === 'mongodb' ||
+    lower.includes('mongodb') ||
+    lower.includes('mongo ') ||
+    /\baggregation\b/.test(lower) ||
+    /\bpipeline\b/.test(lower)
+  ) {
+    return 'qwen:4b';
+  }
+
+  // For demo endpoint, lean towards local & cheap by default
+  if (isDemo) {
+    return 'llama3.2:1b';
+  }
+
+  // Default: local llama
+  return 'llama3.2:1b';
+}
+
 function buildGuidedPrompt(
   userPrompt,
   isUserQuery = false,
@@ -106,6 +148,7 @@ function buildGuidedPrompt(
     "",
     "• When generating MongoDB queries:",
     "  - Prefer the form: db.<collection>.find({ ... }) or db.<collection>.aggregate([ ... ])",
+    "  - You MAY also output only a JSON-style filter object or pipeline array (e.g. { value: 100 } or [ { $match: { ... } } ]).",
     "  - Do NOT append .pretty(), .toArray(), or other chained methods after the find/aggregate call.",
     "  - Do NOT assign the result to a variable (no const result = ...).",
     "  - Use plain JavaScript/JSON-style objects for filters (no arrow functions, no TypeScript).",
@@ -114,6 +157,20 @@ function buildGuidedPrompt(
     "  - Use idiomatic, executable syntax for that language.",
     "  - Do NOT wrap the query in variables or client-library boilerplate.",
     "  - Do NOT include comments inside the query.",
+    "",
+    "EXECUTE-ON-DB COMPATIBILITY (VERY IMPORTANT):",
+    "",
+    "• The FIRST code block you output must contain a SINGLE raw query in a form that can be executed directly against the database.",
+    "• Do NOT mix explanation, prose, or comments inside that code block. It must contain only the query text.",
+    "• For SQL / Postgres / MySQL / SQLite:",
+    "  - Output exactly one statement ending with a semicolon.",
+    "  - Do NOT chain multiple statements with semicolons.",
+    "• For MongoDB:",
+    "  - Prefer: db.<collection>.find({ ... }) or db.<collection>.aggregate([ ... ])",
+    "  - It is also acceptable to output only a JSON-style filter object or pipeline array, which will be used as the filter/pipeline.",
+    "  - Do NOT include shell prompts or helper methods (no >, no .pretty(), no .toArray(), etc.).",
+    "• For Cypher / GraphQL / CQL / Redis / Elasticsearch, output a single self-contained query string that can be sent directly to the database.",
+    "• Any explanations MUST come after the code block, never inside it.",
     "",
     "• Choosing the query language:",
     "  - If the user explicitly mentions a specific language (e.g. 'in Cypher', 'Neo4j', 'GraphQL', 'CQL', 'Redis'), you MUST answer in that language.",
@@ -140,10 +197,9 @@ function buildGuidedPrompt(
     "   - What the query does.",
     "   - Which tables/collections/fields or entities it touches.",
     "   - Any assumptions.",
-    "   - Any potential performance or security issues if applicable.",
     "",
     "If the user already provided a query (in any database language), DO NOT generate a different query:",
-    "  - Show the exact provided query in a fenced block with the correct language (```sql, ```mongodb, ```cypher, ```graphql, etc. if you can infer it).",
+    "  - Show the exact provided query in a fenced block.",
     "  - Then explain that query as described above.",
     "",
     "Keep answers concise, readable, and developer-friendly.",
@@ -266,23 +322,31 @@ function enforceOutputFormat(llmText, originalPrompt, originalWasQuery) {
   }
 }
 
-function buildChatHistoryText(previousQueries, maxPairs = 8) {
+function buildChatHistoryText(previousQueries, maxPairs = 3) {
   if (!previousQueries || !previousQueries.length) return '';
 
-  const doneOnly = previousQueries.filter(q => q.status === 'done');
+  const doneOnly = previousQueries.filter((q) => q.status === 'done');
   const last = doneOnly.slice(-maxPairs);
 
   const lines = [];
+
   for (const q of last) {
     if (q.prompt) {
       lines.push(`User: ${q.prompt}`);
     }
+
     if (q.response) {
-      lines.push(`Assistant: ${q.response}`);
+      // Only keep the first code block (the query)
+      const match = q.response.match(/```[\s\S]*?```/);
+      if (match) {
+        lines.push(`Assistant (query): ${match[0]}`);
+      }
     }
   }
 
-  return lines.join("\n\n");
+  const joined = lines.join("\n\n");
+  // Extra safety: full history text hard capped
+  return joined.length > 1800 ? joined.slice(-1800) : joined;
 }
 
 /**
@@ -334,16 +398,6 @@ router.post('/', limiter, auth, async (req, res) => {
 
     const chatHistoryText = buildChatHistoryText(previousQueries);
 
-    // Create pending Query record so frontend can reference it immediately if needed
-    saved = await Query.create({
-      user: userId,
-      chat: chat._id,
-      prompt: cleaned,
-      model: model || undefined,
-      status: 'pending',
-      createdAt: new Date()
-    });
-
     // Decide which query language to guide the LLM towards
     const langHint = detectQueryLanguageHint(cleaned);
     let queryTypeHint;
@@ -360,7 +414,15 @@ router.post('/', limiter, auth, async (req, res) => {
       queryTypeHint = 'sql_or_mongo';
     }
 
-    // Build the guided prompt for the LLM, now with history context and multi-language support
+    // Handle model: respect explicit model, or choose for "auto"/undefined
+    const incomingModel = typeof model === 'string' ? model.trim() : undefined;
+    let resolvedModel;
+    if (incomingModel && incomingModel !== 'auto') {
+      resolvedModel = incomingModel;
+    } else {
+      resolvedModel = chooseModelForPrompt(cleaned, queryTypeHint, originalWasQuery);
+    }
+
     const guidedPrompt = buildGuidedPrompt(
       cleaned,
       originalWasQuery,
@@ -368,37 +430,38 @@ router.post('/', limiter, auth, async (req, res) => {
       chatHistoryText
     );
 
-    console.log(guidedPrompt); // for debugging
+    saved = await Query.create({
+      user: userId,
+      chat: chat._id,
+      prompt: cleaned,
+      model: resolvedModel || undefined,
+      status: 'pending',
+      createdAt: new Date()
+    });
 
-    // Call LLM (synchronous) – still single string prompt
     const llmResult = await queryLLM({
       prompt: guidedPrompt,
-      model,
+      model: resolvedModel,
       max_tokens: max_tokens || 512,
       temperature: typeof temperature === 'number' ? temperature : 0.2
     });
 
-    // llmResult expected shape: { text, raw, usage, sql? }
     const { text = '', raw = null, usage = null } = llmResult || {};
 
-    // Ensure `text` is a string (safety) and then enforce the output format
     const answerStringRaw = (typeof text === 'string') ? text : String(text || '');
     const answerString = enforceOutputFormat(answerStringRaw, cleaned, originalWasQuery);
 
-    // Save result to DB: response is the plain string, raw kept for debugging
     saved.response = answerString;
-    saved.raw = raw;        // full raw stored in DB if you want to inspect later
+    saved.raw = raw;
     saved.usage = usage;
-    saved.model = model || saved.model;
+    saved.model = resolvedModel || saved.model;
     saved.status = 'done';
     await saved.save();
 
-    // Update chat's last updated time
     chat.updatedAt = new Date();
     await chat.save();
 
-    // Build minimal frontend payload
-    const updatedAt = new Date(); // use a concrete updatedAt for response
+    const updatedAt = new Date();
     const payload = {
       queryId: saved._id,
       chatId: chat._id,
@@ -406,14 +469,13 @@ router.post('/', limiter, auth, async (req, res) => {
       status: saved.status,
       createdAt: saved.createdAt,
       updatedAt: updatedAt,
-      response: answerString // <-- plain string only
+      response: answerString
     };
 
     return res.json(payload);
   } catch (err) {
     console.error('Query error', err);
 
-    // attempt to mark the saved query as failed if it exists
     try {
       if (saved && saved._id) {
         saved.status = 'failed';
@@ -433,7 +495,6 @@ router.post('/', limiter, auth, async (req, res) => {
   }
 });
 
-// replace the existing demo route with this implementation
 router.post('/demo', limiter, async (req, res) => {
   try {
     const { prompt: rawPrompt, model, max_tokens, temperature } = req.body || {};
@@ -446,8 +507,27 @@ router.post('/demo', limiter, async (req, res) => {
     const isGraphQLQuery = looksLikeGraphQL(cleaned);
     const originalWasQuery = isSQLQuery || isMongoQuery || isCypherQuery || isGraphQLQuery;
 
-    // default demo model -> llama3.2:1b (will be normalized in queryLLM)
-    const modelParam = model || 'llama3.2:1b';
+    // Decide queryTypeHint for demo as well (helps auto-model routing)
+    const langHint = detectQueryLanguageHint(cleaned);
+    let queryTypeHint;
+    if (langHint) {
+      queryTypeHint = langHint;
+    } else if (isMongoQuery) {
+      queryTypeHint = 'mongodb';
+    } else if (isSQLQuery) {
+      queryTypeHint = 'sql';
+    } else {
+      queryTypeHint = 'sql_or_mongo';
+    }
+
+    // default demo model -> llama3.2:1b, unless "auto" or explicit model
+    const incomingModel = typeof model === 'string' ? model.trim() : undefined;
+    let modelParam;
+    if (incomingModel && incomingModel !== 'auto') {
+      modelParam = incomingModel;
+    } else {
+      modelParam = chooseModelForPrompt(cleaned, queryTypeHint, originalWasQuery, { isDemo: true });
+    }
 
     // Build a much stricter guided prompt: only produce the query text.
     // If ambiguous, the model MUST output exactly the token AMBIGUOUS_PROMPT (no extra text).
