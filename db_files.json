@@ -1,0 +1,56 @@
+{
+  "ba2ec89d-43e4-4e91-82e5-6788a00b8261": {
+    "id": "ba2ec89d-43e4-4e91-82e5-6788a00b8261",
+    "originalName": "query-results.csv",
+    "path": "/home/rifaque/querycraft/querycraft-backend/uploads/1764492014936-436e23aa-2e58-478d-9885-cf243b99d096-query-results.csv",
+    "size": 1335,
+    "uploadedAt": "2025-11-30T08:40:14.945Z",
+    "ext": ".csv",
+    "type": "csv"
+  },
+  "925108a5-e463-4f2a-a81b-c953e82f7014": {
+    "id": "925108a5-e463-4f2a-a81b-c953e82f7014",
+    "originalName": "sample.db",
+    "path": "/home/rifaque/querycraft/querycraft-backend/uploads/1764874418436-61b41267-c244-465f-9c96-f5f99ffe6c48-sample.db",
+    "size": 12288,
+    "uploadedAt": "2025-12-04T18:53:38.439Z",
+    "ext": ".db",
+    "type": "sqlite"
+  },
+  "fb23dcf5-c025-4ede-a7ff-acd3f5827f2b": {
+    "id": "fb23dcf5-c025-4ede-a7ff-acd3f5827f2b",
+    "originalName": "sample.db",
+    "path": "/home/rifaque/querycraft/querycraft-backend/uploads/1764874455205-f056f084-2f6a-4a22-a8a2-5585eff0b330-sample.db",
+    "size": 12288,
+    "uploadedAt": "2025-12-04T18:54:15.209Z",
+    "ext": ".db",
+    "type": "sqlite"
+  },
+  "7f0d7ab8-26c3-4f5c-825c-116b4cd78100": {
+    "id": "7f0d7ab8-26c3-4f5c-825c-116b4cd78100",
+    "originalName": "sample.db",
+    "path": "/home/rifaque/querycraft/querycraft-backend/uploads/1764874575949-6b66672a-b22a-47ab-b052-75e834164644-sample.db",
+    "size": 12288,
+    "uploadedAt": "2025-12-04T18:56:15.951Z",
+    "ext": ".db",
+    "type": "sqlite"
+  },
+  "bcc35792-cee3-488d-89e7-4c7ea675dbb8": {
+    "id": "bcc35792-cee3-488d-89e7-4c7ea675dbb8",
+    "originalName": "sample.db",
+    "path": "/home/rifaque/querycraft/querycraft-backend/uploads/1764874713238-042f756e-35f6-4d0a-b522-393b09edd896-sample.db",
+    "size": 12288,
+    "uploadedAt": "2025-12-04T18:58:33.240Z",
+    "ext": ".db",
+    "type": "sqlite"
+  },
+  "43f8d7ab-5128-4cb6-92fd-28ff8ec0149c": {
+    "id": "43f8d7ab-5128-4cb6-92fd-28ff8ec0149c",
+    "originalName": "sample.db",
+    "path": "/home/rifaque/querycraft/querycraft-backend/uploads/1764875845796-a157d8c9-0c8b-4c78-b551-43b1bd532782-sample.db",
+    "size": 12288,
+    "uploadedAt": "2025-12-04T19:17:25.799Z",
+    "ext": ".db",
+    "type": "sqlite"
+  }
+}
