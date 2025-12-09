@@ -25,10 +25,8 @@ const MODEL_MAP = {
   'llama1b': 'llama3.2:1b',
   'llama3.2:1b': 'llama3.2:1b',
 
-  'gemini': 'gemini-1.5-pro',
-  'gemini-1.5-pro': 'gemini-1.5-pro',
+  'gemini': 'gemini-2.5-flash',
   'gemini-2.5-flash': 'gemini-2.5-flash',
-  'gemini-2.5-pro': 'gemini-2.5-pro',
 
   'phi3': 'phi3:mini-4k-instruct',
   'phi3-mini': 'phi3:mini-4k-instruct',
@@ -40,7 +38,6 @@ const MODEL_MAP = {
   'or-deepseek-r1': 'openrouter:deepseek/deepseek-r1',
   'or-qwen2.5-72b-free': 'openrouter:qwen/qwen-2.5-72b-instruct:free',
   'or-grok-code-fast': 'openrouter:x-ai/grok-code-fast-1',
-  'or-grok-4.1-fast': 'openrouter:x-ai/grok-4.1-fast:free',
   'or-qwen3-235b-a22b': 'openrouter:qwen/qwen3-235b-a22b:free',
   'or-qwen3-coder': 'openrouter:qwen/qwen3-coder:free',
 };

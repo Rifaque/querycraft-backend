@@ -84,46 +84,110 @@ function detectQueryLanguageHint(s) {
 }
 
 function chooseModelForPrompt(prompt, queryTypeHint, originalWasQuery, options = {}) {
-  const lower = (prompt || '').toLowerCase();
-  const { isDemo = false } = options;
+  const text = (prompt || '').toLowerCase();
+  const len = (prompt || '').length;
+  const {
+    isDemo = false,
+    preferLowCost = false,
+    preferLowLatency = false,
+    preferLocal = false,
+    preferHighAccuracy = false,
+  } = options;
 
-  // If user pasted an existing query and wants explanation, local is fine
-  if (originalWasQuery && prompt.length < 2000) {
-    // Prefer lightweight local for explanations
-    return 'llama3.2:1b';
-  }
-
-  // Prefer Gemini for long / explanation-heavy / very NL-heavy prompts
+  // NOTE: we intentionally avoid 'or-grok-4.1-fast' here if it's unavailable.
+  // Use 'or-grok-code-fast' or 'or-qwen3-coder' as code-specialists instead.
+  const contains = (arr) => arr.some(s => text.includes(s));
+  const looksLikeCode = () =>
+    contains(['function ', 'console.log', 'import ', 'from ', 'def ', 'class ', '() =>', 'async ', 'await ']) ||
+    /<\/?[a-z][\s\S]*>/i.test(prompt || '') ||
+    /#include\s|int\s+main\(|printf\(/.test(prompt || '') ||
+    /\btsc\b|\bnode\b/.test(text);
+  const looksLikeSQL = () => /\bselect\b|\binsert\b|\bupdate\b|\bdelete\b|\bfrom\b|\bwhere\b/.test(text);
+  const looksLikeMongo = () => queryTypeHint === 'mongodb' || text.includes('mongodb') || text.includes('db.') || text.includes('aggregation') || text.includes('pipeline');
   const wantsExplanation =
-    lower.includes('explain') ||
-    lower.includes('step by step') ||
-    lower.includes('detailed') ||
-    lower.includes('in detail') ||
-    lower.includes('what does this do');
+    text.includes('explain') ||
+    text.includes('step by step') ||
+    text.includes('detailed') ||
+    text.includes('in detail') ||
+    text.includes('what does this do') ||
+    text.includes('why does');
 
-  if (prompt.length > 1200 || wantsExplanation) {
-    return 'gemini-1.5-pro';
+  if (originalWasQuery && len < 2000) {
+    if (preferLocal || preferLowCost) return 'llama3.2:1b';
+    if (preferLowLatency) return 'phi3:mini-4k-instruct';
+    return 'phi3:mini-4k-instruct';
   }
 
-  // Mongo / NoSQL style stuff → qwen
-  if (
-    queryTypeHint === 'mongodb' ||
-    lower.includes('mongodb') ||
-    lower.includes('mongo ') ||
-    /\baggregation\b/.test(lower) ||
-    /\bpipeline\b/.test(lower)
-  ) {
+  if (isDemo) {
+    if (looksLikeCode()) return 'llama3.2:1b';
+    return preferLowCost || preferLocal ? 'llama3.2:1b' : 'phi3:mini-4k-instruct';
+  }
+
+  if (/vector search|semantic search|faiss|pinecone|weaviate|milvus|semantic similarity/.test(text) || queryTypeHint === 'retrieval' || queryTypeHint === 'search') {
+    return 'or-deepseek-r1';
+  }
+
+  if (looksLikeMongo() || queryTypeHint === 'mongodb') {
+    if (preferLowCost) return 'qwen:4b';
+    if (preferLowLatency) return 'qwen:4b';
+    if (preferHighAccuracy) return 'or-qwen2.5-72b-free';
     return 'qwen:4b';
   }
 
-  // For demo endpoint, lean towards local & cheap by default
-  if (isDemo) {
-    return 'llama3.2:1b';
+  if (looksLikeSQL() || queryTypeHint === 'nl2sql' || queryTypeHint === 'sql') {
+    if (preferLowCost) return 'qwen:4b';
+    if (preferLowLatency) return 'qwen:4b';
+    if (preferHighAccuracy) return 'or-qwen2.5-72b-free';
+    return 'qwen:4b';
   }
 
-  // Default: local llama
-  return 'llama3.2:1b';
+  // Code: prefer code-specialists but avoid or-grok-4.1-fast if provider doesn't expose it
+  if (looksLikeCode() || queryTypeHint === 'code') {
+    if (preferHighAccuracy) return 'or-qwen3-coder';
+    if (preferLowLatency) return 'or-grok-code-fast';
+    // default code fallback
+    return 'or-grok-code-fast';
+  }
+
+  if (len > 1400 || wantsExplanation || /research paper|longform|contract|agreement|detailed analysis/.test(text)) {
+    if (preferLowCost) return 'mistral:7b-instruct';
+    if (preferLowLatency) return 'gemini-2.5-flash';
+    if (preferHighAccuracy) return 'gemini-2.5-flash';
+    return 'gemini-2.5-flash';
+  }
+
+  if (wantsExplanation) {
+    if (preferLowCost) return 'mistral:7b-instruct';
+    if (preferLowLatency) return 'gemini-2.5-flash';
+    return 'gemini-2.5-flash';
+  }
+
+  if (contains(['write a', 'draft', 'story', 'poem', 'blog post', 'marketing', 'ad copy', 'creative', 'rewrite this'])) {
+    if (preferLowCost) return 'mistral:7b-instruct';
+    if (preferLowLatency) return 'gemini-2.5-flash';
+    return 'gemini-2.5-flash';
+  }
+
+  if (preferHighAccuracy) {
+    if (looksLikeCode()) return 'or-qwen3-coder';
+    return 'or-qwen3-235b-a22b';
+  }
+
+  if (preferLowCost || preferLocal) {
+    if (looksLikeCode()) return 'llama3.2:1b';
+    return 'mistral:7b-instruct';
+  }
+  if (preferLowLatency) {
+    if (looksLikeCode()) return 'or-grok-code-fast';
+    return 'gemini-2.5-flash';
+  }
+
+  if (looksLikeCode()) return 'or-grok-code-fast';
+  if (looksLikeMongo() || looksLikeSQL()) return 'qwen:4b';
+
+  return 'gemini-2.5-flash';
 }
+
 
 function buildGuidedPrompt(
   userPrompt,
